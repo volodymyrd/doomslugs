@@ -1,10 +1,8 @@
-use crate::clock::{Clock, Duration, Instant};
-use crate::model::{
-    AccountId, Approval, ApprovalInner, Balance, BlockHeight, BlockHeightDelta, CryptoHash,
-    ValidatorSigner,
-};
 use std::collections::HashMap;
 use std::sync::Arc;
+use time::ext::InstantExt;
+use crate::clock::{Clock, Duration, Instant, Utc};
+use crate::model::{AccountId, Approval, ApprovalInner, Balance, BlockHeight, BlockHeightDelta, CryptoHash, ValidatorSigner};
 
 /// Have that many iterations in the timer instead of `loop` to prevent potential bugs from blocking
 /// the node
@@ -20,39 +18,8 @@ const MAX_HEIGHTS_AHEAD_TO_STORE_APPROVALS: BlockHeight = 10_000;
 // Number of blocks (before head) for which to keep the history of approvals (for debugging).
 const MAX_HEIGHTS_BEFORE_TO_STORE_APPROVALS: u64 = 20;
 
-#[derive(Debug)]
-struct DoomslugApprovalsTracker {
-    clock: Clock,
-    witness: HashMap<AccountId, (Approval, Instant)>,
-    account_id_to_stakes: HashMap<AccountId, (Balance, Balance)>,
-    // total_stake_this_epoch: Balance,
-    approved_stake_this_epoch: Balance,
-    total_stake_next_epoch: Balance,
-    approved_stake_next_epoch: Balance,
-    time_passed_threshold: Option<Instant>,
-    threshold_mode: DoomslugThresholdMode,
-}
-
-#[derive(Debug)]
-/// Approvals can arrive before the corresponding blocks, and we need a meaningful way to keep as
-/// many approvals as possible that can be useful in the future, while not allowing an adversary
-/// to spam us with invalid approvals.
-/// To that extent, for each `account_id` and each `target_height` we keep exactly one approval,
-/// whichever came last. We only maintain those for
-///  a) `account_id`s that match the corresponding epoch (and for which we can validate a signature)
-///  b) `target_height`s for which we produce blocks
-///  c) `target_height`s within a meaningful horizon from the current tip.
-/// This class is responsible for maintaining witnesses for the blocks, while also ensuring that
-/// only one approval per (`account_id`) is kept. We instantiate one such class per height, thus
-/// ensuring that only one approval is kept per (`target_height`, `account_id`). `Doomslug` below
-/// ensures that only instances within the horizon are kept, and the user of the `Doomslug` is
-/// responsible for ensuring that only approvals for proper account_ids with valid signatures are
-/// provided.
-struct DoomslugApprovalsTrackersAtHeight {
-    clock: Clock,
-    approval_trackers: HashMap<ApprovalInner, DoomslugApprovalsTracker>,
-    last_approval_per_account: HashMap<AccountId, ApprovalInner>,
-}
+// Maximum amount of historical approvals that we'd keep for debugging purposes.
+const MAX_HISTORY_SIZE: usize = 1000;
 
 /// The threshold for doomslug to create a block.
 /// `TwoThirds` means the block can only be produced if at least 2/3 of the stake is approving it,
@@ -61,16 +28,17 @@ struct DoomslugApprovalsTrackersAtHeight {
 ///             in many tests (e.g. `cross_shard_tx`) to create lots of forkfulness.
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub enum DoomslugThresholdMode {
+    NoApprovals,
     TwoThirds,
 }
 
-#[derive(Debug)]
-struct DoomslugTip {
-    block_hash: CryptoHash,
-    height: BlockHeight,
+/// The result of processing an approval.
+#[derive(PartialEq, Eq, Debug)]
+pub enum DoomslugBlockProductionReadiness {
+    NotReady,
+    ReadySince(Instant),
 }
 
-#[derive(Debug)]
 struct DoomslugTimer {
     started: Instant,
     last_endorsement_sent: Instant,
@@ -80,6 +48,7 @@ struct DoomslugTimer {
     delay_step: Duration,
     max_delay: Duration,
 }
+
 impl DoomslugTimer {
     /// Computes the delay to sleep given the number of heights from the last final block
     /// This is what `T` represents in the paper.
@@ -91,13 +60,30 @@ impl DoomslugTimer {
     /// Duration to sleep
     pub fn get_delay(&self, n: BlockHeightDelta) -> Duration {
         let n32 = u32::try_from(n).unwrap_or(u32::MAX);
-        std::cmp::min(
-            self.max_delay,
-            self.min_delay + self.delay_step * n32.saturating_sub(2),
-        )
+        std::cmp::min(self.max_delay, self.min_delay + self.delay_step * n32.saturating_sub(2))
     }
 }
-#[derive(Debug)]
+
+struct DoomslugTip {
+    block_hash: CryptoHash,
+    height: BlockHeight,
+}
+
+struct DoomslugApprovalsTracker {
+    clock: Clock,
+    witness: HashMap<AccountId, (Approval, Utc)>,
+    account_id_to_stakes: HashMap<AccountId, (Balance, Balance)>,
+    total_stake_this_epoch: Balance,
+    approved_stake_this_epoch: Balance,
+    total_stake_next_epoch: Balance,
+    approved_stake_next_epoch: Balance,
+    time_passed_threshold: Option<Instant>,
+    threshold_mode: DoomslugThresholdMode,
+}
+
+/// Contains all the logic for Doomslug, but no integration with chain or storage. The integration
+/// happens via `PersistentDoomslug` struct. The split is to simplify testing of the logic separate
+/// from the chain.
 pub struct Doomslug {
     clock: Clock,
     approval_tracking: HashMap<BlockHeight, DoomslugApprovalsTrackersAtHeight>,
@@ -137,10 +123,7 @@ impl Doomslug {
             largest_approval_height: 0,
             largest_final_height: 0,
             largest_threshold_height: 0,
-            tip: DoomslugTip {
-                block_hash: CryptoHash::default(),
-                height: 0,
-            },
+            tip: DoomslugTip { block_hash: CryptoHash::default(), height: 0 },
             endorsement_pending: false,
             timer: DoomslugTimer {
                 started: clock.now(),
@@ -154,34 +137,6 @@ impl Doomslug {
             threshold_mode,
         }
     }
-
-    /// Updates the current tip of the chain. Restarts the timer accordingly.
-    ///
-    /// # Arguments
-    /// * `block_hash`     - the hash of the new tip
-    /// * `height`         - the height of the tip
-    /// * `last_ds_final_height` - last height at which a block in this chain has doomslug finality
-    pub fn set_tip(
-        &mut self,
-        block_hash: CryptoHash,
-        height: BlockHeight,
-        // last_final_height: BlockHeight,
-    ) {
-        debug_assert!(height > self.tip.height || self.tip.height == 0);
-        self.tip = DoomslugTip { block_hash, height };
-
-        //self.largest_final_height.set(last_final_height);
-        self.timer.height = height + 1;
-        self.timer.started = self.clock.now();
-
-        self.approval_tracking.retain(|h, _| {
-            *h > height.saturating_sub(MAX_HEIGHTS_BEFORE_TO_STORE_APPROVALS)
-                && *h <= height + MAX_HEIGHTS_AHEAD_TO_STORE_APPROVALS
-        });
-
-        self.endorsement_pending = true;
-    }
-
     /// Is expected to be called periodically and processed the timer (`start_timer` in the paper)
     /// If the `cur_time` way ahead of last time the `process_timer` was called, will only process
     /// a bounded number of steps, to avoid an infinite loop in case of some bugs.
@@ -209,7 +164,7 @@ impl Doomslug {
             // The `endorsement_delay` is time to send approval to the block producer at `timer.height`,
             // while the `skip_delay` is the time before sending the approval to BP of `timer_height + 1`,
             // so it makes sense for them to be at least 2x apart
-            debug_assert!(skip_delay >= 2 * self.timer.endorsement_delay);
+            assert!(skip_delay >= 2 * self.timer.endorsement_delay);
 
             let tip_height = self.tip.height;
 
@@ -217,24 +172,11 @@ impl Doomslug {
                 && now >= self.timer.last_endorsement_sent + self.timer.endorsement_delay
             {
                 if tip_height >= self.largest_target_height {
-                    self.largest_target_height += 1;
+                    self.largest_target_height = tip_height + 1;
 
                     if let Some(approval) = self.create_approval(tip_height + 1, signer) {
                         ret.push(approval);
                     }
-                    // self.update_history(ApprovalHistoryEntry {
-                    //     parent_height: tip_height,
-                    //     target_height: tip_height + 1,
-                    //     timer_started_ago_millis: (self
-                    //         .clock
-                    //         .now()
-                    //         .signed_duration_since(self.timer.last_endorsement_sent))
-                    //     .whole_milliseconds()
-                    //     .max(0) as u64,
-                    //     expected_delay_millis: self.timer.endorsement_delay.whole_milliseconds()
-                    //         as u64,
-                    //     approval_creation_time: self.clock.now_utc(),
-                    // });
                 }
 
                 self.timer.last_endorsement_sent = now;
@@ -242,26 +184,14 @@ impl Doomslug {
             }
 
             if now >= self.timer.started + skip_delay {
-                debug_assert!(!self.endorsement_pending);
+                assert!(!self.endorsement_pending);
 
-                self.largest_target_height =
-                    std::cmp::max(self.timer.height + 1, self.largest_target_height);
+                self.largest_target_height
+                    = std::cmp::max(self.timer.height + 1, self.largest_target_height);
 
                 if let Some(approval) = self.create_approval(self.timer.height + 1, signer) {
                     ret.push(approval);
                 }
-                // self.update_history(ApprovalHistoryEntry {
-                //     parent_height: tip_height,
-                //     target_height: self.timer.height + 1,
-                //     timer_started_ago_millis: (self
-                //         .clock
-                //         .now()
-                //         .signed_duration_since(self.timer.started))
-                //     .whole_milliseconds()
-                //     .max(0) as u64,
-                //     expected_delay_millis: skip_delay.whole_milliseconds() as u64,
-                //     approval_creation_time: self.clock.now_utc(),
-                // });
 
                 // Restart the timer
                 self.timer.started += skip_delay;
@@ -273,29 +203,72 @@ impl Doomslug {
 
         ret
     }
+
     fn create_approval(
         &self,
         target_height: BlockHeight,
         signer: &Option<Arc<ValidatorSigner>>,
     ) -> Option<Approval> {
         signer.as_ref().map(|signer| {
-            Approval::new(
-                self.tip.block_hash,
-                self.tip.height,
-                target_height,
-                &*signer,
-            )
+            Approval::new(self.tip.block_hash, self.tip.height, target_height, &*signer)
         })
     }
+
+    /// Updates the current tip of the chain. Restarts the timer accordingly.
+    ///
+    /// # Arguments
+    /// * `block_hash`     - the hash of the new tip
+    /// * `height`         - the height of the tip
+    /// * `last_ds_final_height` - last height at which a block in this chain has doomslug finality
+    pub fn set_tip(
+        &mut self,
+        block_hash: CryptoHash,
+        height: BlockHeight,
+        last_final_height: BlockHeight,
+    ) {
+        assert!(height > self.tip.height || self.tip.height == 0);
+        self.tip = DoomslugTip { block_hash, height };
+
+        self.largest_final_height = last_final_height;
+        self.timer.height = height + 1;
+        self.timer.started = self.clock.now();
+
+        self.approval_tracking.retain(|h, _| {
+            *h > height.saturating_sub(MAX_HEIGHTS_BEFORE_TO_STORE_APPROVALS)
+                && *h <= height + MAX_HEIGHTS_AHEAD_TO_STORE_APPROVALS
+        });
+
+        self.endorsement_pending = true;
+    }
+}
+
+/// Approvals can arrive before the corresponding blocks, and we need a meaningful way to keep as
+/// many approvals as possible that can be useful in the future, while not allowing an adversary
+/// to spam us with invalid approvals.
+/// To that extent, for each `account_id` and each `target_height` we keep exactly one approval,
+/// whichever came last. We only maintain those for
+///  a) `account_id`s that match the corresponding epoch (and for which we can validate a signature)
+///  b) `target_height`s for which we produce blocks
+///  c) `target_height`s within a meaningful horizon from the current tip.
+/// This class is responsible for maintaining witnesses for the blocks, while also ensuring that
+/// only one approval per (`account_id`) is kept. We instantiate one such class per height, thus
+/// ensuring that only one approval is kept per (`target_height`, `account_id`). `Doomslug` below
+/// ensures that only instances within the horizon are kept, and the user of the `Doomslug` is
+/// responsible for ensuring that only approvals for proper account_ids with valid signatures are
+/// provided.
+struct DoomslugApprovalsTrackersAtHeight {
+    clock: Clock,
+    approval_trackers: HashMap<ApprovalInner, DoomslugApprovalsTracker>,
+    last_approval_per_account: HashMap<AccountId, ApprovalInner>,
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use crate::clock::{Duration, FakeClock, Utc};
     use crate::doomslugs::{Doomslug, DoomslugThresholdMode};
     use crate::model::{ApprovalInner, hash};
     use crate::tests::create_test_signer;
-    use std::sync::Arc;
 
     #[test]
     fn test_endorsements_and_skips_basic() {
@@ -311,16 +284,128 @@ mod tests {
             DoomslugThresholdMode::TwoThirds,
         );
 
-        // Set a new potential tip, must produce an endorsement
-        ds.set_tip(hash(&[1]), 1);
-        // move timer in future, plus 399ms
+        // Set a new tip, must produce an endorsement
+        ds.set_tip(hash(&[1]), 1, 1);
         clock.advance(Duration::milliseconds(399));
         assert_eq!(ds.process_timer(&signer).len(), 0);
         clock.advance(Duration::milliseconds(1));
-        let approvals= ds.process_timer(&signer);
-        assert!(approvals.len() > 0);
-        let approval = approvals.into_iter().nth(0).unwrap();
+        let approval = ds.process_timer(&signer).into_iter().nth(0).unwrap();
         assert_eq!(approval.inner, ApprovalInner::Endorsement(hash(&[1])));
         assert_eq!(approval.target_height, 2);
+
+        // Same tip => no approval
+        assert_eq!(ds.process_timer(&signer), vec![]);
+
+        // The block was `ds_final` and therefore started the timer. Try checking before one second expires
+        clock.advance(Duration::milliseconds(599));
+        assert_eq!(ds.process_timer(&signer), vec![]);
+
+        // But one second should trigger the skip
+        clock.advance(Duration::milliseconds(1));
+        match ds.process_timer(&signer) {
+            approvals if approvals.is_empty() => assert!(false),
+            approvals => {
+                assert_eq!(approvals[0].inner, ApprovalInner::Skip(1));
+                assert_eq!(approvals[0].target_height, 3);
+            }
+        }
+
+        // Not processing a block at height 2 should not produce an appoval
+        ds.set_tip(hash(&[2]), 2, 0);
+        clock.advance(Duration::milliseconds(400));
+        assert_eq!(ds.process_timer(&signer), vec![]);
+
+        // Go forward more so we have 1 second
+        clock.advance(Duration::milliseconds(600));
+
+        // But at height 3 should (also neither block has finality set, keep last final at 0 for now)
+        ds.set_tip(hash(&[3]), 3, 0);
+        clock.advance(Duration::milliseconds(400));
+        let approval = ds.process_timer(&signer).into_iter().nth(0).unwrap();
+        assert_eq!(approval.inner, ApprovalInner::Endorsement(hash(&[3])));
+        assert_eq!(approval.target_height, 4);
+
+        // Go forward more so we have another second
+        clock.advance(Duration::milliseconds(600));
+
+        clock.advance(Duration::milliseconds(199));
+        assert_eq!(ds.process_timer(&signer), vec![]);
+
+        clock.advance(Duration::milliseconds(1));
+        match ds.process_timer(&signer) {
+            approvals if approvals.is_empty() => assert!(false),
+            approvals if approvals.len() == 1 => {
+                assert_eq!(approvals[0].inner, ApprovalInner::Skip(3));
+                assert_eq!(approvals[0].target_height, 5);
+            }
+            _ => assert!(false),
+        }
+
+        // Go forward more so we have another second
+        clock.advance(Duration::milliseconds(800));
+
+        // Now skip 5 (the extra delay is 200+300 = 500)
+        clock.advance(Duration::milliseconds(499));
+        assert_eq!(ds.process_timer(&signer), vec![]);
+
+        clock.advance(Duration::milliseconds(1));
+        match ds.process_timer(&signer) {
+            approvals if approvals.is_empty() => assert!(false),
+            approvals => {
+                assert_eq!(approvals[0].inner, ApprovalInner::Skip(3));
+                assert_eq!(approvals[0].target_height, 6);
+            }
+        }
+
+        // Go forward more so we have another second
+        clock.advance(Duration::milliseconds(500));
+
+        // Skip 6 (the extra delay is 0+200+300+400 = 900)
+        clock.advance(Duration::milliseconds(899));
+        assert_eq!(ds.process_timer(&signer), vec![]);
+
+        clock.advance(Duration::milliseconds(1));
+        match ds.process_timer(&signer) {
+            approvals if approvals.is_empty() => assert!(false),
+            approvals => {
+                assert_eq!(approvals[0].inner, ApprovalInner::Skip(3));
+                assert_eq!(approvals[0].target_height, 7);
+            }
+        }
+
+        // Go forward more so we have another second
+        clock.advance(Duration::milliseconds(100));
+
+        // Accept block at 5 with finality on the prev block, expect it to not produce an approval
+        ds.set_tip(hash(&[5]), 5, 4);
+        clock.advance(Duration::milliseconds(400));
+        assert_eq!(ds.process_timer(&signer), vec![]);
+
+        // Skip a whole bunch of heights by moving 100 seconds ahead
+        clock.advance(Duration::seconds(100));
+        assert!(ds.process_timer(&signer).len() > 10);
+
+        // Add some random small number of milliseconds to test that when the next block is added, the
+        // timer is reset
+        clock.advance(Duration::milliseconds(17));
+
+        // No approval, since we skipped 6
+        ds.set_tip(hash(&[6]), 6, 4);
+        clock.advance(Duration::milliseconds(400));
+        assert_eq!(ds.process_timer(&signer), vec![]);
+
+        // The block height was less than the timer height, and thus the timer was reset.
+        // The wait time for height 7 with last ds final block at 5 is 1100
+        clock.advance(Duration::milliseconds(699));
+        assert_eq!(ds.process_timer(&signer), vec![]);
+
+        clock.advance(Duration::milliseconds(1));
+        match ds.process_timer(&signer) {
+            approvals if approvals.is_empty() => assert!(false),
+            approvals => {
+                assert_eq!(approvals[0].inner, ApprovalInner::Skip(6));
+                assert_eq!(approvals[0].target_height, 8);
+            }
+        }
     }
 }
