@@ -21,7 +21,6 @@ impl Clock {
     /// Current time according to the monotone clock.
     pub fn now(&self) -> Instant {
         match &self.0 {
-            ClockInner::Real => Instant::now(),
             ClockInner::Fake(fake) => fake.now(),
         }
     }
@@ -29,7 +28,6 @@ impl Clock {
 
 #[derive(Clone, Debug)]
 enum ClockInner {
-    Real,
     Fake(FakeClock),
 }
 
@@ -50,6 +48,10 @@ impl FakeClock {
 
     pub fn clock(&self) -> Clock {
         Clock(ClockInner::Fake(self.clone()))
+    }
+
+    pub fn advance(&self, d: Duration) {
+        self.0.lock().unwrap().advance(d);
     }
 }
 
@@ -75,6 +77,15 @@ impl FakeClockInner {
 
     pub fn now(&mut self) -> Instant {
         self.instant
+    }
+
+    pub fn advance(&mut self, d: Duration) {
+        assert!(d >= Duration::ZERO);
+        if d == Duration::ZERO {
+            return;
+        }
+        self.instant += d;
+        self.utc += d;
     }
 }
 

@@ -1,13 +1,16 @@
-use std::collections::HashMap;
+use ed25519_dalek::Signer as ed25519Signer;
+use sha2::Digest;
 use std::fmt;
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 use std::sync::Arc;
-use sha2::Digest;
 
 /// Height of the block.
 pub type BlockHeight = u64;
+
+/// Block height delta that measures the difference between `BlockHeight`s.
+pub type BlockHeightDelta = u64;
 
 /// Balance is type for storing amounts of tokens.
 pub type Balance = u128;
@@ -57,6 +60,19 @@ pub enum ApprovalInner {
     Endorsement(CryptoHash),
     Skip(BlockHeight),
 }
+impl ApprovalInner {
+    pub fn new(
+        parent_hash: &CryptoHash,
+        parent_height: BlockHeight,
+        target_height: BlockHeight,
+    ) -> Self {
+        if target_height == parent_height + 1 {
+            ApprovalInner::Endorsement(*parent_hash)
+        } else {
+            ApprovalInner::Skip(parent_height)
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Signature {
@@ -75,8 +91,8 @@ pub enum PublicKey {
 
 impl Display for PublicKey {
     fn fmt(&self, fmt: &mut Formatter) -> std::fmt::Result {
-        let (key_data) = match self {
-            PublicKey::ED25519(public_key) => (&public_key.0[..]),
+        let key_data = match self {
+            PublicKey::ED25519(public_key) => &public_key.0[..],
         };
         write!(fmt, "{}", Bs58(key_data))
     }
@@ -122,6 +138,14 @@ impl SecretKey {
             )),
         }
     }
+    pub fn sign(&self, data: &[u8]) -> Signature {
+        match &self {
+            SecretKey::ED25519(secret_key) => {
+                let keypair = ed25519_dalek::SigningKey::from_keypair_bytes(&secret_key.0).unwrap();
+                Signature::ED25519(keypair.sign(data))
+            }
+        }
+    }
 }
 
 #[derive(Eq, Ord, Hash, Clone, Debug, PartialEq, PartialOrd)]
@@ -148,6 +172,29 @@ pub struct Approval {
     pub target_height: BlockHeight,
     pub signature: Signature,
     pub account_id: AccountId,
+}
+impl Approval {
+    pub fn new(
+        parent_hash: CryptoHash,
+        parent_height: BlockHeight,
+        target_height: BlockHeight,
+        signer: &ValidatorSigner,
+    ) -> Self {
+        let inner = ApprovalInner::new(&parent_hash, parent_height, target_height);
+        let signature = signer.sign_approval(&inner, target_height);
+        Approval {
+            inner,
+            target_height,
+            signature,
+            account_id: signer.validator_id().clone(),
+        }
+    }
+
+    pub fn get_data_for_sig(inner: &ApprovalInner, target_height: BlockHeight) -> Vec<u8> {
+        println!("{:?}, {:?}", inner, target_height);
+        //[borsh::to_vec(&inner).unwrap().as_ref(), target_height.to_le_bytes().as_ref()].concat()
+        vec![]
+    }
 }
 
 /// Stores validator and its stake for two consecutive epochs.
@@ -191,6 +238,10 @@ impl Signer {
             secret_key,
         }
     }
+
+    pub fn sign(&self, data: &[u8]) -> Signature {
+        self.secret_key.sign(data)
+    }
 }
 /// Signer that keeps secret key in memory and signs locally.
 #[derive(Clone, Debug, PartialEq)]
@@ -200,9 +251,19 @@ pub struct ValidatorSigner {
 }
 
 impl ValidatorSigner {
+    /// Account id of the given validator.
+    pub fn validator_id(&self) -> &AccountId {
+        &self.account_id
+    }
+
     pub fn from_seed(account_id: AccountId, seed: &str) -> Self {
         let signer = Arc::new(Signer::from_seed(account_id.clone(), seed).into());
         Self { account_id, signer }
+    }
+    /// Signs approval of given parent hash and reference hash.
+    fn sign_approval(&self, inner: &ApprovalInner, target_height: BlockHeight) -> Signature {
+        self.signer
+            .sign(&Approval::get_data_for_sig(inner, target_height))
     }
 }
 
