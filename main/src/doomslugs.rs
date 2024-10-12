@@ -1,43 +1,10 @@
-use std::collections::HashMap;
 use std::sync::Arc;
-use time::ext::InstantExt;
-use crate::clock::{Clock, Duration, Instant, Utc};
-use crate::model::{AccountId, Approval, ApprovalInner, Balance, BlockHeight, BlockHeightDelta, CryptoHash, ValidatorSigner};
+use crate::clock::{Clock, Duration, Instant};
+use crate::model::{Approval, BlockHeight, BlockHeightDelta, CryptoHash, ValidatorSigner};
 
 /// Have that many iterations in the timer instead of `loop` to prevent potential bugs from blocking
 /// the node
 const MAX_TIMER_ITERS: usize = 20;
-
-/// How many heights ahead to track approvals. This needs to be sufficiently large so that we can
-/// recover after rather long network interruption, but not too large to consume too much memory if
-/// someone in the network spams with invalid approvals. Note that we will only store approvals for
-/// heights that are targeting us, which is once per as many heights as there are block producers,
-/// thus 10_000 heights in practice will mean on the order of one hundred entries.
-const MAX_HEIGHTS_AHEAD_TO_STORE_APPROVALS: BlockHeight = 10_000;
-
-// Number of blocks (before head) for which to keep the history of approvals (for debugging).
-const MAX_HEIGHTS_BEFORE_TO_STORE_APPROVALS: u64 = 20;
-
-// Maximum amount of historical approvals that we'd keep for debugging purposes.
-const MAX_HISTORY_SIZE: usize = 1000;
-
-/// The threshold for doomslug to create a block.
-/// `TwoThirds` means the block can only be produced if at least 2/3 of the stake is approving it,
-///             and is what should be used in production (and what guarantees finality)
-/// `NoApprovals` means the block production is not blocked on approvals. This is used
-///             in many tests (e.g. `cross_shard_tx`) to create lots of forkfulness.
-#[derive(PartialEq, Eq, Debug, Clone, Copy)]
-pub enum DoomslugThresholdMode {
-    NoApprovals,
-    TwoThirds,
-}
-
-/// The result of processing an approval.
-#[derive(PartialEq, Eq, Debug)]
-pub enum DoomslugBlockProductionReadiness {
-    NotReady,
-    ReadySince(Instant),
-}
 
 struct DoomslugTimer {
     started: Instant,
@@ -69,41 +36,21 @@ struct DoomslugTip {
     height: BlockHeight,
 }
 
-struct DoomslugApprovalsTracker {
-    clock: Clock,
-    witness: HashMap<AccountId, (Approval, Utc)>,
-    account_id_to_stakes: HashMap<AccountId, (Balance, Balance)>,
-    total_stake_this_epoch: Balance,
-    approved_stake_this_epoch: Balance,
-    total_stake_next_epoch: Balance,
-    approved_stake_next_epoch: Balance,
-    time_passed_threshold: Option<Instant>,
-    threshold_mode: DoomslugThresholdMode,
-}
-
 /// Contains all the logic for Doomslug, but no integration with chain or storage. The integration
 /// happens via `PersistentDoomslug` struct. The split is to simplify testing of the logic separate
 /// from the chain.
 pub struct Doomslug {
     clock: Clock,
-    approval_tracking: HashMap<BlockHeight, DoomslugApprovalsTrackersAtHeight>,
     /// Largest target height for which we issued an approval
     largest_target_height: BlockHeight,
     /// Largest height for which we saw a block containing 1/2 endorsements in it
     largest_final_height: BlockHeight,
-    /// Largest height for which we saw threshold approvals (and thus can potentially create a block)
-    largest_threshold_height: BlockHeight,
-    /// Largest target height of approvals that we've received
-    largest_approval_height: BlockHeight,
     /// Information Doomslug tracks about the chain tip
     tip: DoomslugTip,
     /// Whether an endorsement (or in general an approval) was sent since updating the tip
     endorsement_pending: bool,
     /// Information to track the timer (see `start_timer` routine in the paper)
     timer: DoomslugTimer,
-    /// How many approvals to have before producing a block. In production should be always `HalfStake`,
-    ///    but for many tests we use `NoApprovals` to invoke more forkfulness
-    threshold_mode: DoomslugThresholdMode,
 }
 
 impl Doomslug {
@@ -114,15 +61,11 @@ impl Doomslug {
         min_delay: Duration,
         delay_step: Duration,
         max_delay: Duration,
-        threshold_mode: DoomslugThresholdMode,
     ) -> Self {
         Doomslug {
             clock: clock.clone(),
-            approval_tracking: HashMap::new(),
             largest_target_height,
-            largest_approval_height: 0,
             largest_final_height: 0,
-            largest_threshold_height: 0,
             tip: DoomslugTip { block_hash: CryptoHash::default(), height: 0 },
             endorsement_pending: false,
             timer: DoomslugTimer {
@@ -134,7 +77,6 @@ impl Doomslug {
                 delay_step,
                 max_delay,
             },
-            threshold_mode,
         }
     }
     /// Is expected to be called periodically and processed the timer (`start_timer` in the paper)
@@ -233,40 +175,15 @@ impl Doomslug {
         self.timer.height = height + 1;
         self.timer.started = self.clock.now();
 
-        self.approval_tracking.retain(|h, _| {
-            *h > height.saturating_sub(MAX_HEIGHTS_BEFORE_TO_STORE_APPROVALS)
-                && *h <= height + MAX_HEIGHTS_AHEAD_TO_STORE_APPROVALS
-        });
-
         self.endorsement_pending = true;
     }
-}
-
-/// Approvals can arrive before the corresponding blocks, and we need a meaningful way to keep as
-/// many approvals as possible that can be useful in the future, while not allowing an adversary
-/// to spam us with invalid approvals.
-/// To that extent, for each `account_id` and each `target_height` we keep exactly one approval,
-/// whichever came last. We only maintain those for
-///  a) `account_id`s that match the corresponding epoch (and for which we can validate a signature)
-///  b) `target_height`s for which we produce blocks
-///  c) `target_height`s within a meaningful horizon from the current tip.
-/// This class is responsible for maintaining witnesses for the blocks, while also ensuring that
-/// only one approval per (`account_id`) is kept. We instantiate one such class per height, thus
-/// ensuring that only one approval is kept per (`target_height`, `account_id`). `Doomslug` below
-/// ensures that only instances within the horizon are kept, and the user of the `Doomslug` is
-/// responsible for ensuring that only approvals for proper account_ids with valid signatures are
-/// provided.
-struct DoomslugApprovalsTrackersAtHeight {
-    clock: Clock,
-    approval_trackers: HashMap<ApprovalInner, DoomslugApprovalsTracker>,
-    last_approval_per_account: HashMap<AccountId, ApprovalInner>,
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use crate::clock::{Duration, FakeClock, Utc};
-    use crate::doomslugs::{Doomslug, DoomslugThresholdMode};
+    use crate::doomslugs::{Doomslug};
     use crate::model::{ApprovalInner, hash};
     use crate::tests::create_test_signer;
 
@@ -281,7 +198,6 @@ mod tests {
             Duration::milliseconds(1000),
             Duration::milliseconds(100),
             Duration::milliseconds(3000),
-            DoomslugThresholdMode::TwoThirds,
         );
 
         // Set a new tip, must produce an endorsement
