@@ -24,6 +24,14 @@ impl Clock {
             ClockInner::Fake(fake) => fake.now(),
         }
     }
+
+    /// Current time according to the system/walltime clock.
+    pub fn now_utc(&self) -> Utc {
+        match &self.0 {
+            //ClockInner::Real => Utc::now_utc(),
+            ClockInner::Fake(fake) => fake.now_utc(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -52,6 +60,11 @@ impl FakeClock {
 
     pub fn advance(&self, d: Duration) {
         self.0.lock().unwrap().advance(d);
+    }
+
+
+    pub fn now_utc(&self) -> Utc {
+        self.0.lock().unwrap().now_utc()
     }
 }
 
@@ -86,6 +99,10 @@ impl FakeClockInner {
         }
         self.instant += d;
         self.utc += d;
+    }
+
+    pub fn now_utc(&mut self) -> Utc {
+        self.utc
     }
 }
 
